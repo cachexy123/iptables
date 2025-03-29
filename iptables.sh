@@ -338,13 +338,13 @@ parse_and_apply_rule() {
     local host_port=""
     local protocol=""
     
-    # 尝试多种常见的docker port输出格式
+    # 尝试多种常见的docker port输出格式，使用更简单的正则表达式
     # 格式1: 80/tcp -> 0.0.0.0:20004
-    if [[ "$mapping" =~ ([0-9]+)/(tcp|udp)[[:space:]]*->[[:space:]]*([0-9.]+):([0-9]+) ]]; then
+    if [[ "$mapping" =~ ([0-9]+)/(tcp|udp).*->.*([0-9.]+):([0-9]+) ]]; then
         host_port="${BASH_REMATCH[4]}"
         protocol="${BASH_REMATCH[2]}"
     # 格式2: 80/tcp -> :::20004
-    elif [[ "$mapping" =~ ([0-9]+)/(tcp|udp)[[:space:]]*->[[:space:]]*:::([0-9]+) ]]; then
+    elif [[ "$mapping" =~ ([0-9]+)/(tcp|udp).*->.*:::([0-9]+) ]]; then
         host_port="${BASH_REMATCH[3]}"
         protocol="${BASH_REMATCH[2]}"
     # 格式3: 0.0.0.0:20004->80/tcp
