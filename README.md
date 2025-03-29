@@ -18,7 +18,7 @@
 
 1. 下载脚本:
    ```bash
-   curl -o iptables_interactive.sh https://raw.githubusercontent.com/your-username/iptables-manager/master/iptables_interactive.sh
+   curl -o iptables_interactive.sh https://raw.githubusercontent.com/cachexy123/iptables/master/iptables_interactive.sh
    ```
 
 2. 添加执行权限:
