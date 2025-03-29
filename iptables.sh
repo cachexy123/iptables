@@ -1,13 +1,22 @@
 #!/bin/bash
 
 # iptables端口访问控制管理脚本
-# 用于限制特定端口只能由指定IP访问
+# 用于限制特定端口只能由指定IP访问，包括Docker映射的端口
 
 # 检查是否以root权限运行
 if [ "$(id -u)" -ne 0 ]; then
     echo "错误: 请使用root权限运行此脚本"
     exit 1
 fi
+
+# 检查docker命令是否存在
+check_docker() {
+    if ! command -v docker &> /dev/null; then
+        echo "警告: docker命令未找到，Docker相关功能将不可用"
+        return 1
+    fi
+    return 0
+}
 
 # 常量定义
 RULE_CHAIN="PORT_ACCESS_CONTROL"
@@ -23,6 +32,7 @@ show_help() {
     echo "  3) 删除端口访问规则"
     echo "  4) 查看当前规则"
     echo "  5) 清空所有规则"
+    echo "  6) Docker容器端口限制"
     echo "  0) 退出"
     echo "=================================================="
 }
@@ -198,11 +208,158 @@ clear_rules() {
     fi
 }
 
+# 函数：显示正在运行的Docker容器
+list_docker_containers() {
+    if ! check_docker; then
+        return 1
+    fi
+    
+    echo "正在获取Docker容器列表..."
+    echo "--------------------------"
+    docker ps --format "ID: {{.ID}}\n名称: {{.Names}}\n镜像: {{.Image}}\n端口: {{.Ports}}\n状态: {{.Status}}\n" | grep -v "^$"
+    echo "--------------------------"
+}
+
+# 函数：提取Docker容器的端口映射信息
+get_container_ports() {
+    container_id=$1
+    if ! check_docker; then
+        return 1
+    fi
+    
+    # 获取端口映射信息
+    port_info=$(docker port $container_id 2>/dev/null)
+    if [ -z "$port_info" ]; then
+        echo "未找到端口映射信息"
+        return 1
+    fi
+    
+    echo "$port_info"
+}
+
+# 函数：为Docker容器的端口添加访问控制
+docker_port_control() {
+    echo "Docker容器端口访问控制"
+    echo "----------------------"
+    
+    if ! check_docker; then
+        read -p "按回车键继续..." dummy
+        return 1
+    fi
+    
+    # 显示容器列表
+    list_docker_containers
+    
+    # 获取用户输入
+    read -p "请输入要限制的容器ID (输入'c'取消): " container_id
+    
+    if [[ "$container_id" =~ ^[Cc]$ ]]; then
+        echo "取消操作。"
+        return 0
+    fi
+    
+    # 获取容器端口映射
+    port_info=$(get_container_ports $container_id)
+    if [ $? -ne 0 ]; then
+        echo "无法获取容器端口信息或容器没有映射端口。"
+        read -p "按回车键继续..." dummy
+        return 1
+    fi
+    
+    # 显示端口信息
+    echo "容器端口映射信息:"
+    echo "$port_info" | nl
+    
+    # 选择端口
+    read -p "请选择要限制访问的端口序号 (输入'a'限制所有端口, 输入'c'取消): " port_selection
+    
+    if [[ "$port_selection" =~ ^[Cc]$ ]]; then
+        echo "取消操作。"
+        return 0
+    fi
+    
+    # 获取允许访问的IP
+    read -p "请输入允许访问的IP地址: " ip_address
+    
+    if ! [[ "$ip_address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "错误: 无效的IP地址格式!"
+        read -p "按回车键继续..." dummy
+        return 1
+    fi
+    
+    # 处理端口限制
+    if [[ "$port_selection" =~ ^[Aa]$ ]]; then
+        # 限制所有端口
+        echo "正在为所有映射端口设置访问控制..."
+        
+        while IFS= read -r mapping; do
+            # 提取主机端口和协议
+            if [[ $mapping =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
+                host_port=${BASH_REMATCH[2]}
+                protocol=${BASH_REMATCH[4]}
+                
+                # 添加iptables规则
+                iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
+                iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
+                
+                echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
+            fi
+        done <<< "$port_info"
+    else
+        # 限制选定的端口
+        if ! [[ "$port_selection" =~ ^[0-9]+$ ]]; then
+            echo "错误: 无效的端口序号!"
+            read -p "按回车键继续..." dummy
+            return 1
+        fi
+        
+        # 获取对应的端口映射行
+        mapping=$(echo "$port_info" | sed -n "${port_selection}p")
+        
+        if [ -z "$mapping" ]; then
+            echo "错误: 无效的选择!"
+            read -p "按回车键继续..." dummy
+            return 1
+        fi
+        
+        # 提取主机端口和协议
+        if [[ $mapping =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
+            host_port=${BASH_REMATCH[2]}
+            protocol=${BASH_REMATCH[4]}
+            
+            # 添加iptables规则
+            iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
+            iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
+            
+            echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
+        else
+            echo "错误: 无法解析端口映射信息!"
+            read -p "按回车键继续..." dummy
+            return 1
+        fi
+    fi
+    
+    echo "Docker容器端口访问规则添加成功!"
+    
+    # 询问是否保存规则
+    read -p "是否保存规则以便系统重启后生效? [y/n]: " save_rules
+    if [[ "$save_rules" =~ ^[Yy]$ ]]; then
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
+            echo "规则已保存!"
+        else
+            echo "警告: 无法找到 iptables-save 命令，规则未保存。"
+        fi
+    fi
+    
+    read -p "按回车键继续..." dummy
+}
+
 # 主菜单
 while true; do
     clear
     show_help
-    read -p "请选择操作 [0-5]: " choice
+    read -p "请选择操作 [0-6]: " choice
     
     case $choice in
         0)
@@ -223,6 +380,9 @@ while true; do
             ;;
         5)
             clear_rules
+            ;;
+        6)
+            docker_port_control
             ;;
         *)
             echo "无效的选择，请重试。"
