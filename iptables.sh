@@ -293,17 +293,7 @@ docker_port_control() {
         echo "正在为所有映射端口设置访问控制..."
         
         while IFS= read -r mapping; do
-            # 提取主机端口和协议
-            if [[ $mapping =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
-                host_port=${BASH_REMATCH[2]}
-                protocol=${BASH_REMATCH[4]}
-                
-                # 添加iptables规则
-                iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
-                iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
-                
-                echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
-            fi
+            parse_and_apply_rule "$mapping" "$ip_address"
         done <<< "$port_info"
     else
         # 限制选定的端口
@@ -322,21 +312,7 @@ docker_port_control() {
             return 1
         fi
         
-        # 提取主机端口和协议
-        if [[ $mapping =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
-            host_port=${BASH_REMATCH[2]}
-            protocol=${BASH_REMATCH[4]}
-            
-            # 添加iptables规则
-            iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
-            iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
-            
-            echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
-        else
-            echo "错误: 无法解析端口映射信息!"
-            read -p "按回车键继续..." dummy
-            return 1
-        fi
+        parse_and_apply_rule "$mapping" "$ip_address"
     fi
     
     echo "Docker容器端口访问规则添加成功!"
@@ -353,6 +329,43 @@ docker_port_control() {
     fi
     
     read -p "按回车键继续..." dummy
+}
+
+# 函数：解析端口映射并应用规则
+parse_and_apply_rule() {
+    local mapping="$1"
+    local ip_address="$2"
+    local host_port=""
+    local protocol=""
+    
+    # 尝试多种常见的docker port输出格式
+    # 格式1: 80/tcp -> 0.0.0.0:20004
+    if [[ "$mapping" =~ ([0-9]+)/(tcp|udp)[[:space:]]*->[[:space:]]*([0-9.]+):([0-9]+) ]]; then
+        host_port="${BASH_REMATCH[4]}"
+        protocol="${BASH_REMATCH[2]}"
+    # 格式2: 80/tcp -> :::20004
+    elif [[ "$mapping" =~ ([0-9]+)/(tcp|udp)[[:space:]]*->[[:space:]]*:::([0-9]+) ]]; then
+        host_port="${BASH_REMATCH[3]}"
+        protocol="${BASH_REMATCH[2]}"
+    # 格式3: 0.0.0.0:20004->80/tcp
+    elif [[ "$mapping" =~ ([0-9.]+):([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
+        host_port="${BASH_REMATCH[2]}"
+        protocol="${BASH_REMATCH[4]}"
+    # 格式4: :::20004->80/tcp
+    elif [[ "$mapping" =~ :::([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
+        host_port="${BASH_REMATCH[1]}"
+        protocol="${BASH_REMATCH[3]}"
+    fi
+    
+    if [ -n "$host_port" ] && [ -n "$protocol" ]; then
+        # 添加iptables规则
+        iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
+        iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
+        
+        echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
+    else
+        echo "警告: 无法解析端口映射: $mapping"
+    fi
 }
 
 # 主菜单
