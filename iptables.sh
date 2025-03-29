@@ -338,23 +338,29 @@ parse_and_apply_rule() {
     local host_port=""
     local protocol=""
     
-    # 尝试多种常见的docker port输出格式，使用更简单的正则表达式
-    # 格式1: 80/tcp -> 0.0.0.0:20004
-    if [[ "$mapping" =~ ([0-9]+)/(tcp|udp).*->.*([0-9.]+):([0-9]+) ]]; then
-        host_port="${BASH_REMATCH[4]}"
-        protocol="${BASH_REMATCH[2]}"
-    # 格式2: 80/tcp -> :::20004
-    elif [[ "$mapping" =~ ([0-9]+)/(tcp|udp).*->.*:::([0-9]+) ]]; then
-        host_port="${BASH_REMATCH[3]}"
-        protocol="${BASH_REMATCH[2]}"
-    # 格式3: 0.0.0.0:20004->80/tcp
-    elif [[ "$mapping" =~ ([0-9.]+):([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
-        host_port="${BASH_REMATCH[2]}"
-        protocol="${BASH_REMATCH[4]}"
-    # 格式4: :::20004->80/tcp
-    elif [[ "$mapping" =~ :::([0-9]+)->([0-9]+)/(tcp|udp) ]]; then
-        host_port="${BASH_REMATCH[1]}"
-        protocol="${BASH_REMATCH[3]}"
+    # 使用简单的grep和awk进行解析而不是复杂的正则表达式
+    if echo "$mapping" | grep -q "->"; then
+        # docker port命令格式: 80/tcp -> 0.0.0.0:20004 或 80/tcp -> :::20004
+        container_port=$(echo "$mapping" | awk -F'/' '{print $1}')
+        protocol=$(echo "$mapping" | awk -F'/' '{print $2}' | awk '{print $1}')
+        
+        if echo "$mapping" | grep -q ":::"; then
+            # 格式: 80/tcp -> :::20004
+            host_port=$(echo "$mapping" | awk '{print $3}' | awk -F':' '{print $4}')
+        else
+            # 格式: 80/tcp -> 0.0.0.0:20004
+            host_port=$(echo "$mapping" | awk '{print $3}' | awk -F':' '{print $2}')
+        fi
+    else
+        # docker ps格式: 0.0.0.0:20004->80/tcp 或 :::20004->80/tcp
+        if echo "$mapping" | grep -q ":::"; then
+            # 格式: :::20004->80/tcp
+            host_port=$(echo "$mapping" | awk -F':::' '{print $2}' | awk -F'->' '{print $1}')
+        else
+            # 格式: 0.0.0.0:20004->80/tcp
+            host_port=$(echo "$mapping" | awk -F':' '{print $2}' | awk -F'->' '{print $1}')
+        fi
+        protocol=$(echo "$mapping" | awk -F'/' '{print $2}')
     fi
     
     if [ -n "$host_port" ] && [ -n "$protocol" ]; then
@@ -363,8 +369,10 @@ parse_and_apply_rule() {
         iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
         
         echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
+        return 0
     else
         echo "警告: 无法解析端口映射: $mapping"
+        return 1
     fi
 }
 
