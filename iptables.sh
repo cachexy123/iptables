@@ -338,30 +338,37 @@ parse_and_apply_rule() {
     local host_port=""
     local protocol=""
     
-    # 使用简单的grep和awk进行解析而不是复杂的正则表达式
-    if echo "$mapping" | grep -q "->"; then
+    # 尝试提取端口和协议信息
+    if echo "$mapping" | grep -F "->" > /dev/null; then
         # docker port命令格式: 80/tcp -> 0.0.0.0:20004 或 80/tcp -> :::20004
-        container_port=$(echo "$mapping" | awk -F'/' '{print $1}')
-        protocol=$(echo "$mapping" | awk -F'/' '{print $2}' | awk '{print $1}')
+        protocol=$(echo "$mapping" | cut -d'/' -f2 | cut -d' ' -f1)
         
-        if echo "$mapping" | grep -q ":::"; then
+        # 提取主机端口
+        if echo "$mapping" | grep -F ":::" > /dev/null; then
             # 格式: 80/tcp -> :::20004
-            host_port=$(echo "$mapping" | awk '{print $3}' | awk -F':' '{print $4}')
+            host_port=$(echo "$mapping" | awk '{print $3}' | cut -d':' -f4)
+            if [ -z "$host_port" ]; then
+                host_port=$(echo "$mapping" | awk '{print $3}' | cut -d':' -f1)
+            fi
         else
             # 格式: 80/tcp -> 0.0.0.0:20004
-            host_port=$(echo "$mapping" | awk '{print $3}' | awk -F':' '{print $2}')
+            host_port=$(echo "$mapping" | awk '{print $3}' | cut -d':' -f2)
         fi
     else
         # docker ps格式: 0.0.0.0:20004->80/tcp 或 :::20004->80/tcp
-        if echo "$mapping" | grep -q ":::"; then
+        protocol=$(echo "$mapping" | cut -d'/' -f2)
+        
+        if echo "$mapping" | grep -F ":::" > /dev/null; then
             # 格式: :::20004->80/tcp
-            host_port=$(echo "$mapping" | awk -F':::' '{print $2}' | awk -F'->' '{print $1}')
+            host_port=$(echo "$mapping" | sed 's/.*::://' | cut -d'-' -f1)
         else
             # 格式: 0.0.0.0:20004->80/tcp
-            host_port=$(echo "$mapping" | awk -F':' '{print $2}' | awk -F'->' '{print $1}')
+            host_port=$(echo "$mapping" | cut -d':' -f2 | cut -d'-' -f1)
         fi
-        protocol=$(echo "$mapping" | awk -F'/' '{print $2}')
     fi
+    
+    # 清理协议字符串中可能的干扰字符
+    protocol=$(echo "$protocol" | tr -dc 'a-zA-Z')
     
     if [ -n "$host_port" ] && [ -n "$protocol" ]; then
         # 添加iptables规则
