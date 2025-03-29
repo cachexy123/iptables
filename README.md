@@ -18,17 +18,17 @@
 
 1. 下载脚本:
    ```bash
-   curl -o iptables_interactive.sh https://raw.githubusercontent.com/cachexy123/iptables/master/iptables_interactive.sh
+   curl -o iptables.sh https://raw.githubusercontent.com/cachexy123/iptables/refs/heads/main/iptables.sh
    ```
 
 2. 添加执行权限:
    ```bash
-   chmod +x iptables_interactive.sh
+   chmod +x iptables.sh
    ```
 
 3. 以root权限运行:
    ```bash
-   sudo ./iptables_interactive.sh
+   sudo ./iptables.sh
    ```
 
 ### 使用流程
