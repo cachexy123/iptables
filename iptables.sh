@@ -338,17 +338,17 @@ parse_and_apply_rule() {
     local host_port=""
     local protocol=""
     
-    # 尝试提取端口和协议信息
-    if echo "$mapping" | grep -F "->" > /dev/null; then
+    # 使用更安全的字符串检测方法而不是grep
+    if [[ "$mapping" == *"->"* ]]; then
         # docker port命令格式: 80/tcp -> 0.0.0.0:20004 或 80/tcp -> :::20004
         protocol=$(echo "$mapping" | cut -d'/' -f2 | cut -d' ' -f1)
         
         # 提取主机端口
-        if echo "$mapping" | grep -F ":::" > /dev/null; then
+        if [[ "$mapping" == *":::"* ]]; then
             # 格式: 80/tcp -> :::20004
             host_port=$(echo "$mapping" | awk '{print $3}' | cut -d':' -f4)
             if [ -z "$host_port" ]; then
-                host_port=$(echo "$mapping" | awk '{print $3}' | cut -d':' -f1)
+                host_port=$(echo "$mapping" | awk '{print $3}' | sed 's/.*::://')
             fi
         else
             # 格式: 80/tcp -> 0.0.0.0:20004
@@ -358,17 +358,20 @@ parse_and_apply_rule() {
         # docker ps格式: 0.0.0.0:20004->80/tcp 或 :::20004->80/tcp
         protocol=$(echo "$mapping" | cut -d'/' -f2)
         
-        if echo "$mapping" | grep -F ":::" > /dev/null; then
+        if [[ "$mapping" == *":::"* ]]; then
             # 格式: :::20004->80/tcp
-            host_port=$(echo "$mapping" | sed 's/.*::://' | cut -d'-' -f1)
+            host_port=$(echo "$mapping" | sed 's/.*::://' | sed 's/->.*$//')
         else
             # 格式: 0.0.0.0:20004->80/tcp
-            host_port=$(echo "$mapping" | cut -d':' -f2 | cut -d'-' -f1)
+            host_port=$(echo "$mapping" | cut -d':' -f2 | sed 's/->.*$//')
         fi
     fi
     
     # 清理协议字符串中可能的干扰字符
     protocol=$(echo "$protocol" | tr -dc 'a-zA-Z')
+    
+    # 清理端口号中可能的非数字字符
+    host_port=$(echo "$host_port" | tr -dc '0-9')
     
     if [ -n "$host_port" ] && [ -n "$protocol" ]; then
         # 添加iptables规则
