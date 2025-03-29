@@ -338,41 +338,45 @@ parse_and_apply_rule() {
     local host_port=""
     local protocol=""
     
-    # 使用更安全的字符串检测方法而不是grep
-    if [[ "$mapping" == *"->"* ]]; then
-        # docker port命令格式: 80/tcp -> 0.0.0.0:20004 或 80/tcp -> :::20004
-        protocol=$(echo "$mapping" | cut -d'/' -f2 | cut -d' ' -f1)
+    # 提取端口和协议信息 - 直接处理输入，不调用外部命令
+    if [[ "$mapping" == *" -> "* ]]; then
+        # docker port命令格式: 80/tcp -> 0.0.0.0:20005
+        container_port_with_proto=${mapping%% -> *}
+        protocol=${container_port_with_proto#*/}
+        host_with_port=${mapping##* -> }
         
-        # 提取主机端口
-        if [[ "$mapping" == *":::"* ]]; then
-            # 格式: 80/tcp -> :::20004
-            host_port=$(echo "$mapping" | awk '{print $3}' | cut -d':' -f4)
-            if [ -z "$host_port" ]; then
-                host_port=$(echo "$mapping" | awk '{print $3}' | sed 's/.*::://')
-            fi
+        # 提取主机端口 - 根据不同格式处理
+        if [[ "$host_with_port" == *":"* ]]; then
+            # 格式: 0.0.0.0:20005 或 :::20005
+            host_port=${host_with_port##*:}
         else
-            # 格式: 80/tcp -> 0.0.0.0:20004
-            host_port=$(echo "$mapping" | awk '{print $3}' | cut -d':' -f2)
+            # 直接是端口号
+            host_port=$host_with_port
         fi
     else
         # docker ps格式: 0.0.0.0:20004->80/tcp 或 :::20004->80/tcp
-        protocol=$(echo "$mapping" | cut -d'/' -f2)
+        if [[ "$mapping" == *":"*"->"* ]]; then
+            # 有IP和端口
+            part_before_arrow=${mapping%%->*}
+            host_port=${part_before_arrow##*:}
+        elif [[ "$mapping" == *"->"* ]]; then
+            # 只有端口
+            host_port=${mapping%%->*}
+        fi
         
-        if [[ "$mapping" == *":::"* ]]; then
-            # 格式: :::20004->80/tcp
-            host_port=$(echo "$mapping" | sed 's/.*::://' | sed 's/->.*$//')
-        else
-            # 格式: 0.0.0.0:20004->80/tcp
-            host_port=$(echo "$mapping" | cut -d':' -f2 | sed 's/->.*$//')
+        if [[ "$mapping" == *"/"* ]]; then
+            # 提取协议
+            protocol=${mapping##*/}
         fi
     fi
     
-    # 清理协议字符串中可能的干扰字符
-    protocol=$(echo "$protocol" | tr -dc 'a-zA-Z')
+    # 清理协议字符串 - 只保留字母
+    protocol=$(echo "$protocol" | tr -cd 'a-zA-Z')
     
-    # 清理端口号中可能的非数字字符
-    host_port=$(echo "$host_port" | tr -dc '0-9')
+    # 清理端口号 - 只保留数字
+    host_port=$(echo "$host_port" | tr -cd '0-9')
     
+    # 验证提取的信息
     if [ -n "$host_port" ] && [ -n "$protocol" ]; then
         # 添加iptables规则
         iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
