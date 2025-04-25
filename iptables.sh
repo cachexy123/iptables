@@ -359,81 +359,116 @@ clear_rules() {
             legacy_mode=true
         fi
         
-        if iptables -L $RULE_CHAIN >/dev/null 2>&1; then
-            iptables -F $RULE_CHAIN
-            echo "已清空规则链!"
-            
-            # 如果存在legacy模式，也清空legacy规则链
-            if [ "$legacy_mode" = true ]; then
-                iptables-legacy -F $RULE_CHAIN 2>/dev/null || true
-            fi
-            
-            # 清除其他链中与Docker端口访问控制相关的规则
-            echo "清除FORWARD链中的Docker端口访问控制规则..."
-            # 注意：这只清除我们添加的针对Docker的规则，不会影响其他规则
-            if iptables -L FORWARD >/dev/null 2>&1; then
-                # 删除FORWARD链中与Docker端口相关的DROP规则
-                for port in $(iptables -L FORWARD --line-numbers | grep "DROP" | grep "dpt:" | awk '{print $1}' | sort -nr); do
-                    if [ -n "$port" ]; then
-                        iptables -D FORWARD $port 2>/dev/null || true
-                        
-                        # 如果存在legacy模式，也删除legacy规则
-                        if [ "$legacy_mode" = true ]; then
-                            iptables-legacy -D FORWARD $port 2>/dev/null || true
-                        fi
-                    fi
+        # 询问是否要清除特定端口的规则
+        read -p "是否要清除特定端口的规则？[y/n，默认n]: " clear_specific_port
+        clear_specific_port=${clear_specific_port:-n}
+        
+        if [[ "$clear_specific_port" =~ ^[Yy]$ ]]; then
+            read -p "请输入要清除规则的端口号: " port_to_clear
+            if [[ "$port_to_clear" =~ ^[0-9]+$ ]]; then
+                echo "正在清除端口 $port_to_clear 的所有规则..."
+                for proto in tcp udp; do
+                    clear_docker_port_rules $port_to_clear $proto
                 done
+                echo "端口 $port_to_clear 的规则已清除"
+            else
+                echo "错误: 无效的端口号"
             fi
-            
-            if iptables -L DOCKER-USER >/dev/null 2>&1; then
-                echo "清除DOCKER-USER链中的端口访问控制规则..."
-                iptables -F DOCKER-USER 2>/dev/null || true
-                
-                # 如果存在legacy模式，也清空legacy规则
-                if [ "$legacy_mode" = true ]; then
-                    iptables-legacy -F DOCKER-USER 2>/dev/null || true
-                fi
-            fi
-            
-            echo "清除NAT表中的端口访问控制规则..."
-            if iptables -t nat -L PREROUTING >/dev/null 2>&1; then
-                for port in $(iptables -t nat -L PREROUTING --line-numbers | grep "DROP" | awk '{print $1}' | sort -nr); do
-                    if [ -n "$port" ]; then
-                        iptables -t nat -D PREROUTING $port 2>/dev/null || true
-                        
-                        # 如果存在legacy模式，也删除legacy规则
-                        if [ "$legacy_mode" = true ]; then
-                            iptables-legacy -t nat -D PREROUTING $port 2>/dev/null || true
-                        fi
-                    fi
-                done
-                
-                # 同样清除RETURN规则
-                for port in $(iptables -t nat -L PREROUTING --line-numbers | grep "RETURN" | awk '{print $1}' | sort -nr); do
-                    if [ -n "$port" ]; then
-                        iptables -t nat -D PREROUTING $port 2>/dev/null || true
-                        
-                        # 如果存在legacy模式，也删除legacy规则
-                        if [ "$legacy_mode" = true ]; then
-                            iptables-legacy -t nat -D PREROUTING $port 2>/dev/null || true
-                        fi
-                    fi
-                done
-            fi
-            
-            # 清除RAW表规则
-            if iptables -t raw -L PREROUTING >/dev/null 2>&1; then
-                echo "清除RAW表中的规则..."
-                for port in $(iptables -t raw -L PREROUTING --line-numbers | grep "DROP" | awk '{print $1}' | sort -nr); do
-                    if [ -n "$port" ]; then
-                        iptables -t raw -D PREROUTING $port 2>/dev/null || true
-                    fi
-                done
-            fi
-            
-            echo "已清空所有规则!"
         else
-            echo "规则链 $RULE_CHAIN 不存在，无需清空。"
+            # 清空所有规则
+            if iptables -L $RULE_CHAIN >/dev/null 2>&1; then
+                iptables -F $RULE_CHAIN
+                echo "已清空规则链!"
+                
+                # 如果存在legacy模式，也清空legacy规则链
+                if [ "$legacy_mode" = true ]; then
+                    iptables-legacy -F $RULE_CHAIN 2>/dev/null || true
+                fi
+                
+                # 清除其他链中与Docker端口访问控制相关的规则
+                echo "清除FORWARD链中的Docker端口访问控制规则..."
+                if iptables -L FORWARD >/dev/null 2>&1; then
+                    # 删除FORWARD链中与Docker端口相关的DROP和ACCEPT规则
+                    for port in $(iptables -L FORWARD --line-numbers | grep -E "DROP|ACCEPT" | grep "dpt:" | awk '{print $1}' | sort -nr); do
+                        if [ -n "$port" ]; then
+                            iptables -D FORWARD $port 2>/dev/null || true
+                            
+                            # 如果存在legacy模式，也删除legacy规则
+                            if [ "$legacy_mode" = true ]; then
+                                iptables-legacy -D FORWARD $port 2>/dev/null || true
+                            fi
+                        fi
+                    done
+                fi
+                
+                if iptables -L DOCKER-USER >/dev/null 2>&1; then
+                    echo "清除DOCKER-USER链中的端口访问控制规则..."
+                    iptables -F DOCKER-USER 2>/dev/null || true
+                    
+                    # 如果存在legacy模式，也清空legacy规则
+                    if [ "$legacy_mode" = true ]; then
+                        iptables-legacy -F DOCKER-USER 2>/dev/null || true
+                    fi
+                fi
+                
+                echo "清除NAT表中的端口访问控制规则..."
+                
+                # 清除NAT表DOCKER链规则 - 这是最关键的部分
+                if iptables -t nat -L DOCKER >/dev/null 2>&1; then
+                    echo "清除NAT表DOCKER链中的规则..."
+                    # 只清除RETURN规则，不清除DNAT规则（保留Docker端口映射功能）
+                    for port in $(iptables -t nat -L DOCKER --line-numbers | grep "RETURN" | awk '{print $1}' | sort -nr); do
+                        if [ -n "$port" ]; then
+                            iptables -t nat -D DOCKER $port 2>/dev/null || true
+                            echo "  已删除NAT表DOCKER链规则 #$port"
+                            
+                            # 如果存在legacy模式，也删除legacy规则
+                            if [ "$legacy_mode" = true ]; then
+                                iptables-legacy -t nat -D DOCKER $port 2>/dev/null || true
+                            fi
+                        fi
+                    done
+                fi
+                
+                if iptables -t nat -L PREROUTING >/dev/null 2>&1; then
+                    echo "清除NAT表PREROUTING链中的规则..."
+                    for port in $(iptables -t nat -L PREROUTING --line-numbers | grep -E "DROP|RETURN" | awk '{print $1}' | sort -nr); do
+                        if [ -n "$port" ]; then
+                            iptables -t nat -D PREROUTING $port 2>/dev/null || true
+                            echo "  已删除NAT表PREROUTING链规则 #$port"
+                            
+                            # 如果存在legacy模式，也删除legacy规则
+                            if [ "$legacy_mode" = true ]; then
+                                iptables-legacy -t nat -D PREROUTING $port 2>/dev/null || true
+                            fi
+                        fi
+                    done
+                fi
+                
+                # 清除RAW表规则
+                if iptables -t raw -L PREROUTING >/dev/null 2>&1; then
+                    echo "清除RAW表中的规则..."
+                    for port in $(iptables -t raw -L PREROUTING --line-numbers | grep -E "DROP|ACCEPT" | awk '{print $1}' | sort -nr); do
+                        if [ -n "$port" ]; then
+                            iptables -t raw -D PREROUTING $port 2>/dev/null || true
+                            echo "  已删除RAW表规则 #$port"
+                        fi
+                    done
+                fi
+                
+                # 清除INPUT链中的相关规则
+                echo "清除INPUT链中的相关规则..."
+                for port in $(iptables -L INPUT --line-numbers | grep -E "DROP|ACCEPT" | grep "dpt:" | awk '{print $1}' | sort -nr); do
+                    if [ -n "$port" ]; then
+                        iptables -D INPUT $port 2>/dev/null || true
+                        echo "  已删除INPUT链规则 #$port"
+                    fi
+                done
+                
+                echo "已清空所有规则!"
+            else
+                echo "规则链 $RULE_CHAIN 不存在，无需清空。"
+            fi
         fi
         
         # 询问是否保存规则
@@ -448,6 +483,17 @@ clear_rules() {
                 echo "警告: 无法找到 iptables-save 命令，更改未保存。"
             fi
         fi
+        
+        # 显示清理后的规则状态
+        echo "清理后的规则状态:"
+        echo "-----------------"
+        echo "NAT表DOCKER链规则:"
+        iptables -t nat -L DOCKER -n --line-numbers 2>/dev/null || echo "无法访问NAT表DOCKER链"
+        echo "-----------------"
+        echo "NAT表PREROUTING链规则:"
+        iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DROP|RETURN" 2>/dev/null || echo "没有PREROUTING链过滤规则"
+        
+        echo "规则清理完成!"
     else
         echo "操作已取消。"
     fi
