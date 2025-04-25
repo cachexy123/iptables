@@ -33,6 +33,7 @@ show_help() {
     echo "  4) 查看当前规则"
     echo "  5) 清空所有规则"
     echo "  6) Docker容器端口限制"
+    echo "  7) 系统环境配置"
     echo "  0) 退出"
     echo "=================================================="
 }
@@ -202,11 +203,18 @@ view_rules() {
         echo "DOCKER-USER链不存在"
     fi
     
-    echo -e "\n【重要】NAT表PREROUTING链相关规则:"
-    iptables -t nat -L PREROUTING -v --line-numbers | grep -E "dpt:[0-9]+"
-    
-    echo -e "\nNAT表DOCKER链相关规则(端口映射):"
+    echo -e "\n【最重要】NAT表DOCKER链规则(端口映射):"
     iptables -t nat -L DOCKER -v --line-numbers
+    
+    echo -e "\n【重要】NAT表PREROUTING链相关规则:"
+    iptables -t nat -L PREROUTING -v --line-numbers | grep -E "dpt:[0-9]+|DROP|RETURN"
+    
+    echo -e "\nRAW表规则(如果可用):"
+    if iptables -t raw -L PREROUTING >/dev/null 2>&1; then
+        iptables -t raw -L PREROUTING -v --line-numbers | grep -E "dpt:[0-9]+"
+    else
+        echo "系统不支持RAW表或没有相关规则"
+    fi
     
     echo ""
     read -p "按回车键继续..." dummy
@@ -466,26 +474,88 @@ parse_and_apply_rule() {
         clear_docker_port_rules $host_port $protocol
         
         echo "=============================================================="
-        echo "关键: 在NAT表PREROUTING链前部添加DROP规则，阻止未授权的连接"
+        echo "Docker端口访问控制核心方法"
         echo "=============================================================="
         
-        # 最关键的一步：在NAT表PREROUTING链的最前面添加DROP规则
-        # 这会在Docker的DNAT规则之前执行，从而阻止未授权的流量
-        if ! iptables -t nat -C PREROUTING -p $protocol --dport $host_port ! -s $ip_address -j DROP 2>/dev/null; then
-            iptables -t nat -I PREROUTING 1 -p $protocol --dport $host_port ! -s $ip_address -j DROP
-            echo "已添加NAT表PREROUTING规则：拒绝所有非 $ip_address 的访问请求"
+        # 方法1: 直接修改NAT表中的DOCKER链 (比PREROUTING更优先) - 这是最关键的步骤
+        echo "尝试方法1: 修改NAT表中的DOCKER链 (最优先)"
+        docker_chain_rule_added=false
+        
+        # 首先在NAT表DOCKER链添加RETURN规则 - 允许指定IP访问
+        if iptables -t nat -L DOCKER >/dev/null 2>&1; then
+            echo "发现NAT表DOCKER链，尝试添加规则..."
+            
+            # 添加允许指定IP的规则 - 注意必须在DNAT规则之前
+            iptables -t nat -I DOCKER 1 -p $protocol --dport $host_port -s $ip_address -j RETURN 2>/dev/null || true
+            
+            # 添加拒绝非指定IP的规则
+            iptables -t nat -I DOCKER 1 -p $protocol --dport $host_port ! -s $ip_address -j RETURN 2>/dev/null || true
+            
+            # 验证是否添加成功
+            if iptables -t nat -L DOCKER -n | grep -q "$host_port" | grep -q "RETURN"; then
+                echo "√ 已成功修改NAT表DOCKER链，应该能有效限制端口访问"
+                docker_chain_rule_added=true
+            else
+                echo "× 修改NAT表DOCKER链失败，可能没有足够权限"
+            fi
         else
-            echo "NAT表已存在规则：拒绝所有非 $ip_address 的访问请求"
+            echo "× 未找到NAT表DOCKER链"
         fi
         
-        # 检查添加是否成功
-        if iptables -t nat -C PREROUTING -p $protocol --dport $host_port ! -s $ip_address -j DROP 2>/dev/null; then
-            echo "√ NAT表规则添加成功"
+        # 方法2: 修改NAT表PREROUTING链 (次优先)
+        echo "尝试方法2: 添加NAT表PREROUTING链规则"
+        prerouting_rule_added=false
+        
+        # 检查是否有权限修改NAT表
+        if iptables -t nat -L PREROUTING >/dev/null 2>&1; then
+            echo "检查NAT表权限正常，尝试添加规则..."
+            
+            # 尝试使用DROP目标
+            iptables -t nat -I PREROUTING 1 -p $protocol --dport $host_port ! -s $ip_address -j DROP 2>/dev/null
+            
+            # 检查是否添加成功
+            if iptables -t nat -C PREROUTING -p $protocol --dport $host_port ! -s $ip_address -j DROP 2>/dev/null; then
+                echo "√ 在NAT表PREROUTING链成功添加DROP规则"
+                prerouting_rule_added=true
+            else
+                # 某些系统上NAT表可能不支持DROP目标，尝试使用RETURN
+                echo "× 在NAT表添加DROP规则失败，尝试RETURN目标"
+                
+                iptables -t nat -I PREROUTING 1 -p $protocol --dport $host_port ! -s $ip_address -j RETURN 2>/dev/null
+                
+                if iptables -t nat -C PREROUTING -p $protocol --dport $host_port ! -s $ip_address -j RETURN 2>/dev/null; then
+                    echo "√ 在NAT表PREROUTING链成功添加RETURN规则"
+                    prerouting_rule_added=true
+                else
+                    echo "× 在NAT表添加规则失败，可能需要更高权限"
+                fi
+            fi
         else
-            echo "× NAT表规则添加失败，端口限制可能无效"
+            echo "× 无权访问NAT表PREROUTING链，需要root权限"
         fi
         
-        # 为了完整性，我们也在其他链中添加规则
+        # 方法3: 使用raw表 (最先处理，比NAT表还早) - 某些发行版可能不支持
+        echo "尝试方法3: 使用raw表 (最早处理点)"
+        raw_rule_added=false
+        
+        if iptables -t raw -L PREROUTING >/dev/null 2>&1; then
+            echo "系统支持raw表，尝试添加规则..."
+            
+            # 在raw表添加DROP规则
+            iptables -t raw -I PREROUTING 1 -p $protocol --dport $host_port ! -s $ip_address -j DROP 2>/dev/null
+            
+            if iptables -t raw -C PREROUTING -p $protocol --dport $host_port ! -s $ip_address -j DROP 2>/dev/null; then
+                echo "√ 在raw表添加规则成功，这应该能有效拦截流量"
+                raw_rule_added=true
+            else
+                echo "× 在raw表添加规则失败"
+            fi
+        else
+            echo "× 系统不支持raw表或无权访问"
+        fi
+        
+        # 方法4: 标准iptables规则 (作为后备)
+        echo "添加标准规则作为后备..."
         
         # DOCKER-USER链规则
         if iptables -L DOCKER-USER >/dev/null 2>&1; then
@@ -506,12 +576,27 @@ parse_and_apply_rule() {
         iptables -I $RULE_CHAIN 1 -p $protocol -s $ip_address --dport $host_port -j ACCEPT
         iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
         
+        echo "=============================================================="
         echo "端口访问限制规则添加完成!"
+        
+        # 状态统计
+        if [ "$docker_chain_rule_added" = true ] || [ "$prerouting_rule_added" = true ] || [ "$raw_rule_added" = true ]; then
+            echo "√ 高级规则添加成功，Docker端口限制应该有效"
+        else
+            echo "! 警告: 高级规则添加失败，Docker端口限制可能无效"
+            echo "- 请尝试使用更高权限运行此脚本"
+            echo "- 或尝试手动执行以下命令:"
+            echo "  sudo iptables -t nat -I PREROUTING 1 -p $protocol --dport $host_port ! -s $ip_address -j RETURN"
+        fi
+        
         echo "已添加所有必要规则: 仅允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
         
         # 显示NAT表规则进行确认
+        echo "当前NAT表DOCKER链规则(端口映射):"
+        iptables -t nat -L DOCKER -n --line-numbers | grep -E "$host_port" || echo "未找到相关规则"
+        
         echo "当前NAT表PREROUTING链规则:"
-        iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DROP|$host_port"
+        iptables -t nat -L PREROUTING -n --line-numbers | grep -E "$host_port|DROP|RETURN" || echo "未找到相关规则"
         
         return 0
     else
@@ -527,13 +612,33 @@ clear_docker_port_rules() {
     
     echo "清除端口 $port/$proto 的现有规则..."
     
-    # 首先也是最重要的：清除NAT表PREROUTING链中的相关规则
-    for rule in $(iptables -t nat -L PREROUTING --line-numbers 2>/dev/null | grep -E "dpt:$port" | awk '{print $1}' | sort -nr); do
+    # 清除NAT表DOCKER链中的相关规则
+    if iptables -t nat -L DOCKER >/dev/null 2>&1; then
+        for rule in $(iptables -t nat -L DOCKER --line-numbers 2>/dev/null | grep -E "dpt:$port" | grep "RETURN" | awk '{print $1}' | sort -nr); do
+            if [ -n "$rule" ]; then
+                iptables -t nat -D DOCKER $rule 2>/dev/null || true
+                echo "已删除NAT表DOCKER链规则 #$rule"
+            fi
+        done
+    fi
+    
+    # 清除NAT表PREROUTING链中的相关规则
+    for rule in $(iptables -t nat -L PREROUTING --line-numbers 2>/dev/null | grep -E "dpt:$port|$port" | awk '{print $1}' | sort -nr); do
         if [ -n "$rule" ]; then
             iptables -t nat -D PREROUTING $rule 2>/dev/null || true
             echo "已删除NAT表PREROUTING规则 #$rule"
         fi
     done
+    
+    # 清除raw表的相关规则
+    if iptables -t raw -L PREROUTING >/dev/null 2>&1; then
+        for rule in $(iptables -t raw -L PREROUTING --line-numbers 2>/dev/null | grep -E "dpt:$port" | awk '{print $1}' | sort -nr); do
+            if [ -n "$rule" ]; then
+                iptables -t raw -D PREROUTING $rule 2>/dev/null || true
+                echo "已删除raw表规则 #$rule"
+            fi
+        done
+    fi
     
     # 清除DOCKER-USER链中的相关规则
     if iptables -L DOCKER-USER >/dev/null 2>&1; then
@@ -570,11 +675,60 @@ clear_docker_port_rules() {
     echo "端口 $port/$proto 的现有规则已清除"
 }
 
+# 函数: 配置系统环境支持Docker端口限制
+setup_docker_restriction_env() {
+    echo "正在配置系统环境以支持Docker端口访问限制..."
+    
+    # 检查是否有root权限
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "错误: 需要root权限进行此操作"
+        return 1
+    fi
+    
+    # 检查Docker是否在运行
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+        echo "警告: Docker不可用或未运行"
+        return 1
+    fi
+    
+    # 配置Docker配置文件
+    echo "检查Docker配置..."
+    if [ -f /etc/docker/daemon.json ]; then
+        if ! grep -q "\"iptables\": true" /etc/docker/daemon.json; then
+            echo "Docker配置文件已存在，建议手动确保iptables设置为启用"
+            echo "请在/etc/docker/daemon.json中确保有 \"iptables\": true 设置"
+        else
+            echo "Docker已正确配置为使用iptables"
+        fi
+    else
+        echo "Docker配置文件不存在，尝试创建..."
+        
+        mkdir -p /etc/docker
+        echo '{
+  "iptables": true
+}' > /etc/docker/daemon.json
+        
+        echo "Docker配置文件已创建，建议重启Docker服务以应用更改"
+        echo "可以使用命令: systemctl restart docker"
+    fi
+    
+    # 确保必要的内核模块加载
+    echo "检查必要的内核模块..."
+    for module in iptable_nat iptable_filter iptable_mangle iptable_raw; do
+        if ! lsmod | grep -q $module; then
+            echo "尝试加载内核模块 $module..."
+            modprobe $module 2>/dev/null || echo "警告: 无法加载模块 $module"
+        fi
+    done
+    
+    echo "环境配置完成"
+}
+
 # 主菜单
 while true; do
     clear
     show_help
-    read -p "请选择操作 [0-6]: " choice
+    read -p "请选择操作 [0-7]: " choice
     
     case $choice in
         0)
@@ -598,6 +752,9 @@ while true; do
             ;;
         6)
             docker_port_control
+            ;;
+        7)
+            setup_docker_restriction_env
             ;;
         *)
             echo "无效的选择，请重试。"
