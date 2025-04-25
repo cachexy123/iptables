@@ -27,54 +27,168 @@ show_help() {
     echo "          iptables 端口访问控制管理脚本           "
     echo "=================================================="
     echo "使用方法:"
-    echo "  1) 初始化规则链"
+    echo "  1) 初始化环境和规则链 (首次使用必选)"
     echo "  2) 添加端口访问规则"
     echo "  3) 删除端口访问规则"
     echo "  4) 查看当前规则"
     echo "  5) 清空所有规则"
     echo "  6) Docker容器端口限制"
-    echo "  7) 系统环境配置"
     echo "  0) 退出"
     echo "=================================================="
 }
 
-# 函数: 初始化规则链
-init_chain() {
-    echo "正在初始化规则链..."
+# 函数: 综合初始化 (合并原选项1和7)
+init_environment_and_chains() {
+    echo "正在执行全面系统初始化..."
+    echo "------------------------"
     
-    # 检查规则链是否已存在，如存在则先清空
+    # 第1步: 配置系统环境
+    echo "[1/3] 配置系统环境支持..."
+    
+    # 检查Docker是否在运行
+    if command -v docker >/dev/null 2>&1; then
+        if docker info >/dev/null 2>&1; then
+            echo "√ Docker正在运行"
+            
+            # 配置Docker配置文件
+            echo "  检查Docker配置..."
+            if [ -f /etc/docker/daemon.json ]; then
+                if grep -q "\"iptables\": true" /etc/docker/daemon.json; then
+                    echo "  √ Docker已正确配置使用iptables"
+                else
+                    echo "  ! Docker配置可能需要修改"
+                    echo "    建议在/etc/docker/daemon.json中添加 \"iptables\": true 设置"
+                    echo "    然后重启Docker服务"
+                fi
+            else
+                echo "  ! Docker配置文件不存在，尝试创建..."
+                
+                mkdir -p /etc/docker
+                echo '{
+  "iptables": true
+}' > /etc/docker/daemon.json
+                
+                echo "  √ Docker配置文件已创建"
+                echo "  ! 建议重启Docker服务以应用更改: systemctl restart docker"
+            fi
+        else
+            echo "! Docker已安装但未运行，Docker相关功能可能不可用"
+        fi
+    else
+        echo "! Docker未安装，Docker相关功能将不可用"
+    fi
+    
+    # 加载必要的内核模块
+    echo "  检查必要的内核模块..."
+    modules_loaded=true
+    for module in iptable_nat iptable_filter iptable_mangle iptable_raw; do
+        if ! lsmod | grep -q $module; then
+            echo "  尝试加载内核模块 $module..."
+            if ! modprobe $module 2>/dev/null; then
+                echo "  ! 警告: 无法加载模块 $module，部分功能可能不可用"
+                modules_loaded=false
+            fi
+        fi
+    done
+    
+    if [ "$modules_loaded" = true ]; then
+        echo "  √ 所有必要的内核模块已加载"
+    fi
+    
+    # 第2步: 初始化规则链
+    echo "[2/3] 初始化iptables规则链..."
+    
+    # 检查是否存在旧的iptables-legacy
+    legacy_mode=false
+    if iptables-legacy -L >/dev/null 2>&1; then
+        echo "  检测到系统同时存在iptables和iptables-legacy"
+        echo "  将同时配置两套系统"
+        legacy_mode=true
+    fi
+    
+    # 清空现有规则链
     if iptables -L $RULE_CHAIN >/dev/null 2>&1; then
-        echo "规则链 $RULE_CHAIN 已存在，正在清空..."
+        echo "  规则链 $RULE_CHAIN 已存在，正在清空..."
         iptables -F $RULE_CHAIN
     else
-        echo "创建新的规则链 $RULE_CHAIN..."
+        echo "  创建新的规则链 $RULE_CHAIN..."
         iptables -N $RULE_CHAIN
     fi
     
-    # 检查INPUT链中是否已有引用，如没有则添加
+    # 如果存在旧系统，也在旧系统中创建
+    if [ "$legacy_mode" = true ]; then
+        if iptables-legacy -L $RULE_CHAIN >/dev/null 2>&1; then
+            iptables-legacy -F $RULE_CHAIN
+        else
+            iptables-legacy -N $RULE_CHAIN
+        fi
+    fi
+    
+    # INPUT链引用
     if ! iptables -C INPUT -j $RULE_CHAIN >/dev/null 2>&1; then
-        echo "将 $RULE_CHAIN 链添加到INPUT链..."
+        echo "  将 $RULE_CHAIN 链添加到INPUT链..."
         iptables -A INPUT -j $RULE_CHAIN
     fi
     
-    # 检查FORWARD链中是否已有引用（对Docker很重要）
+    # FORWARD链引用
     if ! iptables -C FORWARD -j $RULE_CHAIN >/dev/null 2>&1; then
-        echo "将 $RULE_CHAIN 链添加到FORWARD链..."
+        echo "  将 $RULE_CHAIN 链添加到FORWARD链..."
         iptables -A FORWARD -j $RULE_CHAIN
     fi
     
-    # 检查是否存在DOCKER-USER链（Docker创建的特殊链）
+    # DOCKER-USER链引用
     if iptables -L DOCKER-USER >/dev/null 2>&1; then
         if ! iptables -C DOCKER-USER -j $RULE_CHAIN >/dev/null 2>&1; then
-            echo "将 $RULE_CHAIN 链添加到DOCKER-USER链..."
+            echo "  将 $RULE_CHAIN 链添加到DOCKER-USER链..."
             iptables -A DOCKER-USER -j $RULE_CHAIN
         fi
-        echo "提示: Docker容器规则推荐通过DOCKER-USER链添加"
+        echo "  √ Docker专用链已配置"
     else
-        echo "提示: 未检测到DOCKER-USER链，这可能表明Docker未使用默认网络配置"
+        echo "  ! 未检测到DOCKER-USER链，这对Docker端口限制可能有影响"
     fi
     
-    echo "规则链初始化完成!"
+    # 第3步: 验证配置
+    echo "[3/3] 验证配置结果..."
+    
+    # 验证规则链
+    if iptables -L $RULE_CHAIN >/dev/null 2>&1; then
+        echo "  √ 规则链 $RULE_CHAIN 创建成功"
+    else
+        echo "  × 规则链 $RULE_CHAIN 创建失败"
+    fi
+    
+    # 验证NAT表权限
+    if iptables -t nat -L >/dev/null 2>&1; then
+        echo "  √ NAT表访问权限正常"
+    else
+        echo "  × 无法访问NAT表，Docker端口限制可能不生效"
+    fi
+    
+    # 验证raw表权限
+    if iptables -t raw -L >/dev/null 2>&1; then
+        echo "  √ raw表访问权限正常"
+    else
+        echo "  ! 无法访问raw表，但这不会影响主要功能"
+    fi
+    
+    # 保存规则
+    echo "  正在保存iptables规则..."
+    if command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
+        echo "  √ 规则已保存"
+    else
+        echo "  ! 找不到iptables-save命令，规则未保存"
+        echo "  ! 系统重启后规则可能丢失"
+    fi
+    
+    echo "初始化完成！系统已准备好限制端口访问。"
+    
+    # 忽略传统iptables的警告
+    if [ "$legacy_mode" = true ]; then
+        echo ""
+        echo "注意: 系统存在iptables-legacy，这会导致一些警告信息，但不影响功能。"
+        echo "如果想避免警告，可以考虑将命令更改为使用iptables-legacy。"
+    fi
 }
 
 # 函数: 添加端口访问规则
@@ -185,6 +299,11 @@ delete_rule() {
 view_rules() {
     echo "当前端口访问控制规则"
     echo "--------------------"
+    
+    # 忽略传统iptables警告
+    if iptables-legacy -L >/dev/null 2>&1; then
+        echo "注意: 系统存在iptables-legacy，可能会显示一些警告信息，可以忽略。"
+    fi
     
     echo "规则链 $RULE_CHAIN:"
     if iptables -L $RULE_CHAIN >/dev/null 2>&1; then
@@ -675,60 +794,11 @@ clear_docker_port_rules() {
     echo "端口 $port/$proto 的现有规则已清除"
 }
 
-# 函数: 配置系统环境支持Docker端口限制
-setup_docker_restriction_env() {
-    echo "正在配置系统环境以支持Docker端口访问限制..."
-    
-    # 检查是否有root权限
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "错误: 需要root权限进行此操作"
-        return 1
-    fi
-    
-    # 检查Docker是否在运行
-    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-        echo "警告: Docker不可用或未运行"
-        return 1
-    fi
-    
-    # 配置Docker配置文件
-    echo "检查Docker配置..."
-    if [ -f /etc/docker/daemon.json ]; then
-        if ! grep -q "\"iptables\": true" /etc/docker/daemon.json; then
-            echo "Docker配置文件已存在，建议手动确保iptables设置为启用"
-            echo "请在/etc/docker/daemon.json中确保有 \"iptables\": true 设置"
-        else
-            echo "Docker已正确配置为使用iptables"
-        fi
-    else
-        echo "Docker配置文件不存在，尝试创建..."
-        
-        mkdir -p /etc/docker
-        echo '{
-  "iptables": true
-}' > /etc/docker/daemon.json
-        
-        echo "Docker配置文件已创建，建议重启Docker服务以应用更改"
-        echo "可以使用命令: systemctl restart docker"
-    fi
-    
-    # 确保必要的内核模块加载
-    echo "检查必要的内核模块..."
-    for module in iptable_nat iptable_filter iptable_mangle iptable_raw; do
-        if ! lsmod | grep -q $module; then
-            echo "尝试加载内核模块 $module..."
-            modprobe $module 2>/dev/null || echo "警告: 无法加载模块 $module"
-        fi
-    done
-    
-    echo "环境配置完成"
-}
-
 # 主菜单
 while true; do
     clear
     show_help
-    read -p "请选择操作 [0-7]: " choice
+    read -p "请选择操作 [0-6]: " choice
     
     case $choice in
         0)
@@ -736,7 +806,7 @@ while true; do
             exit 0
             ;;
         1)
-            init_chain
+            init_environment_and_chains
             ;;
         2)
             add_rule
@@ -752,9 +822,6 @@ while true; do
             ;;
         6)
             docker_port_control
-            ;;
-        7)
-            setup_docker_restriction_env
             ;;
         *)
             echo "无效的选择，请重试。"
