@@ -242,7 +242,9 @@ add_rule() {
     echo "规则添加成功!"
     
     # 询问是否保存规则
-    read -p "是否保存规则以便系统重启后生效? [y/n]: " save_rules
+    read -p "是否保存规则以便系统重启后生效? [y/n，默认y]: " save_rules
+    save_rules=${save_rules:-y}  # 如果用户直接回车，设置默认值为y
+    
     if [[ "$save_rules" =~ ^[Yy]$ ]]; then
         if command -v iptables-save >/dev/null 2>&1; then
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
@@ -284,7 +286,9 @@ delete_rule() {
     fi
     
     # 询问是否保存规则
-    read -p "是否保存规则以便系统重启后生效? [y/n]: " save_rules
+    read -p "是否保存规则以便系统重启后生效? [y/n，默认y]: " save_rules
+    save_rules=${save_rules:-y}  # 如果用户直接回车，设置默认值为y
+    
     if [[ "$save_rules" =~ ^[Yy]$ ]]; then
         if command -v iptables-save >/dev/null 2>&1; then
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
@@ -344,12 +348,25 @@ clear_rules() {
     echo "清空所有规则"
     echo "------------"
     
-    read -p "警告: 此操作将删除所有端口访问控制规则。确定继续? [y/n]: " confirm
+    read -p "警告: 此操作将删除所有端口访问控制规则。确定继续? [y/n，默认y]: " confirm
+    confirm=${confirm:-y}  # 如果用户直接回车，设置默认值为y
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # 检查是否存在iptables-legacy
+        legacy_mode=false
+        if iptables-legacy -L >/dev/null 2>&1; then
+            echo "检测到iptables-legacy，将同时清理旧系统规则..."
+            legacy_mode=true
+        fi
+        
         if iptables -L $RULE_CHAIN >/dev/null 2>&1; then
             iptables -F $RULE_CHAIN
             echo "已清空规则链!"
+            
+            # 如果存在legacy模式，也清空legacy规则链
+            if [ "$legacy_mode" = true ]; then
+                iptables-legacy -F $RULE_CHAIN 2>/dev/null || true
+            fi
             
             # 清除其他链中与Docker端口访问控制相关的规则
             echo "清除FORWARD链中的Docker端口访问控制规则..."
@@ -358,21 +375,58 @@ clear_rules() {
                 # 删除FORWARD链中与Docker端口相关的DROP规则
                 for port in $(iptables -L FORWARD --line-numbers | grep "DROP" | grep "dpt:" | awk '{print $1}' | sort -nr); do
                     if [ -n "$port" ]; then
-                        iptables -D FORWARD $port 2>/dev/null
+                        iptables -D FORWARD $port 2>/dev/null || true
+                        
+                        # 如果存在legacy模式，也删除legacy规则
+                        if [ "$legacy_mode" = true ]; then
+                            iptables-legacy -D FORWARD $port 2>/dev/null || true
+                        fi
                     fi
                 done
             fi
             
             if iptables -L DOCKER-USER >/dev/null 2>&1; then
                 echo "清除DOCKER-USER链中的端口访问控制规则..."
-                iptables -F DOCKER-USER
+                iptables -F DOCKER-USER 2>/dev/null || true
+                
+                # 如果存在legacy模式，也清空legacy规则
+                if [ "$legacy_mode" = true ]; then
+                    iptables-legacy -F DOCKER-USER 2>/dev/null || true
+                fi
             fi
             
             echo "清除NAT表中的端口访问控制规则..."
             if iptables -t nat -L PREROUTING >/dev/null 2>&1; then
                 for port in $(iptables -t nat -L PREROUTING --line-numbers | grep "DROP" | awk '{print $1}' | sort -nr); do
                     if [ -n "$port" ]; then
-                        iptables -t nat -D PREROUTING $port 2>/dev/null
+                        iptables -t nat -D PREROUTING $port 2>/dev/null || true
+                        
+                        # 如果存在legacy模式，也删除legacy规则
+                        if [ "$legacy_mode" = true ]; then
+                            iptables-legacy -t nat -D PREROUTING $port 2>/dev/null || true
+                        fi
+                    fi
+                done
+                
+                # 同样清除RETURN规则
+                for port in $(iptables -t nat -L PREROUTING --line-numbers | grep "RETURN" | awk '{print $1}' | sort -nr); do
+                    if [ -n "$port" ]; then
+                        iptables -t nat -D PREROUTING $port 2>/dev/null || true
+                        
+                        # 如果存在legacy模式，也删除legacy规则
+                        if [ "$legacy_mode" = true ]; then
+                            iptables-legacy -t nat -D PREROUTING $port 2>/dev/null || true
+                        fi
+                    fi
+                done
+            fi
+            
+            # 清除RAW表规则
+            if iptables -t raw -L PREROUTING >/dev/null 2>&1; then
+                echo "清除RAW表中的规则..."
+                for port in $(iptables -t raw -L PREROUTING --line-numbers | grep "DROP" | awk '{print $1}' | sort -nr); do
+                    if [ -n "$port" ]; then
+                        iptables -t raw -D PREROUTING $port 2>/dev/null || true
                     fi
                 done
             fi
@@ -383,7 +437,9 @@ clear_rules() {
         fi
         
         # 询问是否保存规则
-        read -p "是否保存更改以便系统重启后生效? [y/n]: " save_rules
+        read -p "是否保存更改以便系统重启后生效? [y/n，默认y]: " save_rules
+        save_rules=${save_rules:-y}  # 如果用户直接回车，设置默认值为y
+        
         if [[ "$save_rules" =~ ^[Yy]$ ]]; then
             if command -v iptables-save >/dev/null 2>&1; then
                 iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
@@ -510,7 +566,9 @@ docker_port_control() {
     check_and_add_docker_chains
     
     # 询问是否保存规则
-    read -p "是否保存规则以便系统重启后生效? [y/n]: " save_rules
+    read -p "是否保存规则以便系统重启后生效? [y/n，默认y]: " save_rules
+    save_rules=${save_rules:-y}  # 如果用户直接回车，设置默认值为y
+    
     if [[ "$save_rules" =~ ^[Yy]$ ]]; then
         if command -v iptables-save >/dev/null 2>&1; then
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
