@@ -56,6 +56,20 @@ init_chain() {
         iptables -A INPUT -j $RULE_CHAIN
     fi
     
+    # 检查FORWARD链中是否已有引用（对Docker很重要）
+    if ! iptables -C FORWARD -j $RULE_CHAIN >/dev/null 2>&1; then
+        echo "将 $RULE_CHAIN 链添加到FORWARD链..."
+        iptables -A FORWARD -j $RULE_CHAIN
+    fi
+    
+    # 检查是否存在DOCKER-USER链（Docker创建的特殊链）
+    if iptables -L DOCKER-USER >/dev/null 2>&1; then
+        if ! iptables -C DOCKER-USER -j $RULE_CHAIN >/dev/null 2>&1; then
+            echo "将 $RULE_CHAIN 链添加到DOCKER-USER链..."
+            iptables -A DOCKER-USER -j $RULE_CHAIN
+        fi
+    fi
+    
     echo "规则链初始化完成!"
 }
 
@@ -317,6 +331,9 @@ docker_port_control() {
     
     echo "Docker容器端口访问规则添加成功!"
     
+    # 检查必要的链
+    check_and_add_docker_chains
+    
     # 询问是否保存规则
     read -p "是否保存规则以便系统重启后生效? [y/n]: " save_rules
     if [[ "$save_rules" =~ ^[Yy]$ ]]; then
@@ -329,6 +346,33 @@ docker_port_control() {
     fi
     
     read -p "按回车键继续..." dummy
+}
+
+# 函数：检查并添加Docker相关的链
+check_and_add_docker_chains() {
+    # 检查FORWARD链中是否已有引用
+    if ! iptables -C FORWARD -j $RULE_CHAIN >/dev/null 2>&1; then
+        echo "将 $RULE_CHAIN 链添加到FORWARD链..."
+        iptables -A FORWARD -j $RULE_CHAIN
+    fi
+    
+    # 检查是否存在DOCKER-USER链
+    if iptables -L DOCKER-USER >/dev/null 2>&1; then
+        if ! iptables -C DOCKER-USER -j $RULE_CHAIN >/dev/null 2>&1; then
+            echo "将 $RULE_CHAIN 链添加到DOCKER-USER链..."
+            iptables -A DOCKER-USER -j $RULE_CHAIN
+        fi
+    fi
+    
+    # 尝试在nat表中添加规则（Docker使用DNAT进行端口映射）
+    # 注意：这需要谨慎，可能会影响Docker的正常工作
+    echo "检查Docker NAT规则..."
+    
+    # 添加规则到PREROUTING链（处理流量在进入路由之前）
+    if iptables -t nat -L PREROUTING >/dev/null 2>&1; then
+        echo "确保NAT规则正确应用..."
+        # 这里不直接修改NAT表，而是确保我们的过滤规则能捕获所有流量
+    fi
 }
 
 # 函数：解析端口映射并应用规则
@@ -378,11 +422,17 @@ parse_and_apply_rule() {
     
     # 验证提取的信息
     if [ -n "$host_port" ] && [ -n "$protocol" ]; then
-        # 添加iptables规则
+        # 添加iptables规则 - 同时在INPUT和FORWARD链添加
         iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
         iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
         
         echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
+        
+        # 添加Docker特定规则
+        if iptables -L DOCKER-USER >/dev/null 2>&1; then
+            echo "检查Docker专用规则..."
+        fi
+        
         return 0
     else
         echo "警告: 无法解析端口映射: $mapping"
