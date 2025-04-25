@@ -68,6 +68,9 @@ init_chain() {
             echo "将 $RULE_CHAIN 链添加到DOCKER-USER链..."
             iptables -A DOCKER-USER -j $RULE_CHAIN
         fi
+        echo "提示: Docker容器规则推荐通过DOCKER-USER链添加"
+    else
+        echo "提示: 未检测到DOCKER-USER链，这可能表明Docker未使用默认网络配置"
     fi
     
     echo "规则链初始化完成!"
@@ -466,36 +469,101 @@ parse_and_apply_rule() {
     if [ -n "$host_port" ] && [ -n "$protocol" ]; then
         echo "正在为端口 $host_port/$protocol 添加访问控制规则..."
         
-        # 1. 添加规则到我们自己的规则链
-        iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
-        iptables -I $RULE_CHAIN -p $protocol -s $ip_address --dport $host_port -j ACCEPT
+        # 首先清除所有可能冲突的规则
+        clear_docker_port_rules $host_port $protocol
         
-        # 2. 直接在DOCKER链中添加规则 - Docker优先级更高
-        if iptables -L DOCKER >/dev/null 2>&1; then
-            echo "正在Docker专用链中添加规则..."
-            # 注意: 在Docker链中直接添加规则可能会影响Docker正常运行，需要小心
-            # 我们尝试在DOCKER-USER链中添加，这是Docker推荐的自定义规则位置
-            if iptables -L DOCKER-USER >/dev/null 2>&1; then
-                iptables -A DOCKER-USER -p $protocol ! -s $ip_address --dport $host_port -j DROP
-                echo "已在DOCKER-USER链中添加拒绝规则"
-            fi
+        echo "步骤1: 添加DOCKER-USER链规则(Docker官方推荐的自定义位置)"
+        if iptables -L DOCKER-USER >/dev/null 2>&1; then
+            # 这是Docker推荐的自定义规则位置 - 在最前面添加规则，优先级最高
+            # 使用"!"非操作符，拒绝除了指定IP外的所有流量
+            iptables -I DOCKER-USER 1 -p $protocol --dport $host_port ! -s $ip_address -j DROP
+            # 注意：在某些Docker版本中，可能需要添加RETURN规则来让流量继续处理
+            iptables -I DOCKER-USER 2 -p $protocol --dport $host_port -s $ip_address -j RETURN
+            echo "已在DOCKER-USER链中添加规则"
+        else
+            echo "没有找到DOCKER-USER链，尝试其他方法..."
         fi
         
-        # 3. 添加规则到PREROUTING链(NAT表) - 这是Docker端口映射最早处理的地方
-        echo "正在NAT表中添加规则..."
-        # 在NAT表的PREROUTING链添加规则，拒绝除指定IP外的所有连接
-        iptables -t nat -I PREROUTING -p $protocol ! -s $ip_address --dport $host_port -j DROP 2>/dev/null
+        echo "步骤2: 添加FORWARD链规则"
+        # 在FORWARD链最前面插入规则，拦截所有目标端口的流量，除了来自允许IP的
+        iptables -I FORWARD 1 -p $protocol --dport $host_port ! -s $ip_address -j DROP
+        echo "已在FORWARD链中添加规则"
         
-        # 4. 添加规则到FORWARD链 - Docker容器通信必经之路
-        echo "正在FORWARD链中添加规则..."
-        iptables -I FORWARD -p $protocol ! -s $ip_address --dport $host_port -j DROP
+        echo "步骤3: 尝试添加NAT表规则"
+        # 在NAT表PREROUTING链中添加规则，这里需要小心，可能会干扰Docker的工作
+        if iptables -t nat -L DOCKER >/dev/null 2>&1; then
+            # Docker使用NAT表中的DOCKER链进行端口映射
+            # 不要直接修改这里的规则，而是在PREROUTING中添加更高优先级的规则
+            iptables -t nat -I PREROUTING 1 -p $protocol --dport $host_port ! -s $ip_address -j DROP 2>/dev/null || true
+            echo "已尝试在NAT表中添加规则"
+        fi
         
-        echo "已添加规则: 允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
+        echo "步骤4: 添加INPUT链规则(可能对docker bridge网络模式有用)"
+        # 对于bridge网络模式，部分流量可能经过INPUT链
+        iptables -I INPUT 1 -p $protocol --dport $host_port ! -s $ip_address -j DROP
+        echo "已在INPUT链中添加规则"
+        
+        # 最后在我们自己的规则链中也添加规则(优先级较低，但作为备份)
+        iptables -A $RULE_CHAIN -p $protocol --dport $host_port -j DROP
+        iptables -I $RULE_CHAIN 1 -p $protocol -s $ip_address --dport $host_port -j ACCEPT
+        
+        echo "端口访问限制规则添加完成!"
+        echo "已添加规则: 仅允许 $ip_address 通过${protocol^^}协议访问端口 $host_port"
+        
         return 0
     else
         echo "警告: 无法解析端口映射: $mapping"
         return 1
     fi
+}
+
+# 函数: 清除指定端口的所有Docker相关规则(避免规则冲突)
+clear_docker_port_rules() {
+    local port=$1
+    local proto=$2
+    
+    echo "清除端口 $port/$proto 的现有规则..."
+    
+    # 清除DOCKER-USER链中的相关规则
+    if iptables -L DOCKER-USER >/dev/null 2>&1; then
+        for rule in $(iptables -L DOCKER-USER --line-numbers | grep "dpt:$port" | awk '{print $1}' | sort -nr); do
+            if [ -n "$rule" ]; then
+                iptables -D DOCKER-USER $rule 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    # 清除FORWARD链中的相关规则
+    for rule in $(iptables -L FORWARD --line-numbers | grep "dpt:$port" | awk '{print $1}' | sort -nr); do
+        if [ -n "$rule" ]; then
+            iptables -D FORWARD $rule 2>/dev/null || true
+        fi
+    done
+    
+    # 清除NAT表PREROUTING链中的相关规则
+    for rule in $(iptables -t nat -L PREROUTING --line-numbers 2>/dev/null | grep "dpt:$port" | awk '{print $1}' | sort -nr); do
+        if [ -n "$rule" ]; then
+            iptables -t nat -D PREROUTING $rule 2>/dev/null || true
+        fi
+    done
+    
+    # 清除INPUT链中的相关规则
+    for rule in $(iptables -L INPUT --line-numbers | grep "dpt:$port" | awk '{print $1}' | sort -nr); do
+        if [ -n "$rule" ]; then
+            iptables -D INPUT $rule 2>/dev/null || true
+        fi
+    done
+    
+    # 清除我们自己规则链中的相关规则
+    if iptables -L $RULE_CHAIN >/dev/null 2>&1; then
+        for rule in $(iptables -L $RULE_CHAIN --line-numbers | grep "dpt:$port" | awk '{print $1}' | sort -nr); do
+            if [ -n "$rule" ]; then
+                iptables -D $RULE_CHAIN $rule 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    echo "端口 $port/$proto 的现有规则已清除"
 }
 
 # 主菜单
